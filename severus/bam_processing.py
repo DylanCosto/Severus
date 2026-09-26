@@ -91,14 +91,15 @@ def get_segment(read, genome_id,sv_size,use_supplementary_tag, ref_ind, ignore_h
     nm = read.get_tag('NM')
     indel = [b for a, b in cigar if a in [CIGAR_INS, CIGAR_DEL]]
     num_of_mismatch = nm - sum(indel)
-    total_segment_length = sum([b for a, b in cigar if a not in CIGAR_CLIP + [CIGAR_DEL]])
+    unaligned_ops = CIGAR_CLIP + [CIGAR_DEL]
+    total_segment_length = sum([b for a, b in cigar if a not in unaligned_ops])
     if total_segment_length == 0:
         return [[], []] 
     mm_rate = int(num_of_mismatch * K_MM / total_segment_length)
     error_rate = int(nm * K_MM/ total_segment_length)
     read_length = sum([k[1] for k in cigar if k[0] != CIGAR_DEL])
     strand = -1 if read.is_reverse else 1
-    sequence = read.query_sequence
+    sequence = None
     hc = 0
     clp = cigar[-1] if read.is_reverse else cigar[0]
     align_start = clp[1] if clp[0] in CIGAR_CLIP else 0
@@ -174,6 +175,8 @@ def get_segment(read, genome_id,sv_size,use_supplementary_tag, ref_ind, ignore_h
                 read_segments.append(ReadSegment(align_start,ins_start, ins_end, ins_pos, ins_pos, ins_pos, ins_pos, read.query_name,
                                                  read.reference_name, strand, read_length,total_segment_length,op_len, haplotype,
                                                  read.mapping_quality, genome_id, mm_rate, True, error_rate, None,PS))
+                if sequence is None:
+                    sequence = read.query_sequence
                 ins_seq = sequence[ins_start - hc: ins_end - hc]
                 read_segments[-1].ins_seq = ins_seq
                 read_segments[-1].ins_pos = (read.reference_start, read.reference_end)
@@ -413,7 +416,7 @@ def get_all_reads_parallel(bam_file, thread_pool, ref_lengths, genome_id,
             fetch_list.append((j, ctg, reg_start, reg_end))
     tasks = [(bam_file, region, genome_id, sv_size, use_supplementary_tag, ignore_hp) for region in fetch_list]
     parsing_results = None
-    parsing_results = thread_pool.starmap(get_all_reads, tasks)
+    parsing_results = thread_pool.starmap(get_all_reads, tasks, chunksize=1)
     segments_by_read = defaultdict(list)
     for alignments in parsing_results:
         for aln in alignments[0]:
@@ -448,27 +451,28 @@ def update_cov_hist(parsing_results, coverage_histograms, genome_id, ref_lengths
         if alignments[1].size == 0:
             continue
         chr_id = list(ref_lengths.keys())[int(alignments[1][0][0])]
-        for j in range(len(alignments[1])):
-            if alignments[1][j][8] > args.min_mapping_quality and alignments[1][j][6] < bg_mm and alignments[1][j][3] > n90 and abs(alignments[1][j][3] - alignments[1][j][4]) < alignments[1][j][4]:
+        for row in alignments[1]:
+            if row[8] > args.min_mapping_quality and row[6] < bg_mm and row[3] > n90 and abs(row[3] - row[4]) < row[4]:
                 read_qual['PASS'] += 1
-                read_qual_len['PASS'] += alignments[1][j][4]
-                hist_start = alignments[1][j][1] // COV_WINDOW
-                hist_end = alignments[1][j][2]// COV_WINDOW
+                read_qual_len['PASS'] += row[4]
+                hist_start = row[1] // COV_WINDOW
+                hist_end = row[2]// COV_WINDOW
+                histogram = coverage_histograms[(genome_id, row[5], chr_id)]
                 for i in range(hist_start, hist_end + 1):
-                    coverage_histograms[(genome_id, alignments[1][j][5], chr_id)][i] += 1
+                    histogram[i] += 1
             else:
-                if alignments[1][j][8] < args.min_mapping_quality:
+                if row[8] < args.min_mapping_quality:
                     read_qual['FAIL_MAPQ'] += 1
-                    read_qual_len['FAIL_MAPQ'] += alignments[1][j][4]
-                elif alignments[1][j][6] > bg_mm:
+                    read_qual_len['FAIL_MAPQ'] += row[4]
+                elif row[6] > bg_mm:
                     read_qual['FAIL_MM'] += 1
-                    read_qual_len['FAIL_MM'] += alignments[1][j][4]
-                elif alignments[1][j][3] < n90:
+                    read_qual_len['FAIL_MM'] += row[4]
+                elif row[3] < n90:
                     read_qual['FAIL_READLEN'] += 1
-                    read_qual_len['FAIL_READLEN'] += alignments[1][j][4]
-                elif abs(alignments[1][j][3] - alignments[1][j][4]) > alignments[1][j][4]:
+                    read_qual_len['FAIL_READLEN'] += row[4]
+                elif abs(row[3] - row[4]) > row[4]:
                     read_qual['FAIL_ALNLEN'] += 1
-                    read_qual_len['FAIL_ALNLEN'] += alignments[1][j][4]
+                    read_qual_len['FAIL_ALNLEN'] += row[4]
 
 def update_coverage_hist(coverage_histograms,genome_ids, ref_lengths, segments_by_read, control_genomes, target_genomes, loh_out):
     
@@ -555,18 +559,29 @@ def write_readqual(segments_by_read, outpath, read_qual, read_qual_len):
 def background_mm_rat(parsing_results, multisample):
     COV_WINDOW_BG_MM = 2000
     QT = 0.95 if not multisample else 0.975
-    mm_list = []
+    counts = defaultdict(int)
     for alignments in parsing_results:
-        for aln in alignments[1]:
-            n_mm = (aln[3] // COV_WINDOW_BG_MM) +1
-            mm_list += [aln[6]] * n_mm
+        info = alignments[1]
+        if info.size:
+            rates, indices = np.unique(info[:, 6], return_inverse=True)
+            weights = np.zeros(len(rates), dtype=np.int64)
+            np.add.at(weights, indices, np.maximum(0, info[:, 3] // COV_WINDOW_BG_MM + 1))
+            for rate, weight in zip(rates, weights):
+                if weight:
+                    counts[int(rate)] += int(weight)
         for seg in alignments[0]:
             if seg.is_clipped or seg.is_insertion:
                 continue
             n_mm = ((seg.ref_end - seg.ref_start) // COV_WINDOW_BG_MM) +1
-            mm_list += [seg.mismatch_rate] * n_mm
-    bg_mm = np.quantile(mm_list, QT)
-    return bg_mm
+            if n_mm > 0:
+                counts[seg.mismatch_rate] += n_mm
+    if not counts:
+        return np.quantile([], QT)
+    values = np.array(sorted(counts))
+    cumulative = np.cumsum([counts[value] for value in values])
+    rank = (int(cumulative[-1]) - 1) * QT
+    indices = np.searchsorted(cumulative, [int(np.floor(rank)), int(np.ceil(rank))], side='right')
+    return np.quantile(values[indices], rank % 1)
 
 def init_mm_hist(ref_lengths):
     mismatch_histograms = defaultdict(list)
@@ -580,11 +595,13 @@ def update_mm_hist(parsing_results, mismatch_histograms, ref_lengths):
         if alignments[1].size == 0:
             continue
         chr_id = ref_ind[int(alignments[1][0][0])]
-        for j in range(len(alignments[1])):
-            hist_start = alignments[1][j][1] // COV_WINDOW_MM
-            hist_end = alignments[1][j][2] // COV_WINDOW_MM
+        histogram = mismatch_histograms[chr_id]
+        for row in alignments[1]:
+            hist_start = row[1] // COV_WINDOW_MM
+            hist_end = row[2] // COV_WINDOW_MM
+            mismatch_rate = int(row[6])
             for i in range(hist_start, hist_end + 1):
-                mismatch_histograms[chr_id][i].append(int(alignments[1][j][6]))
+                histogram[i].append(mismatch_rate)
     
 def background_mm_hist(segments_by_read, mismatch_histograms, bg_mm, ref_lengths):
     MED_PER = 0.1
@@ -682,16 +699,12 @@ def high_mm_check(mm_hist_high, bg_mm, seg):
         return True
 
 def _calc_nx(lengths, norm_len, rate):
-    n50 = 0
-    sum_len = 0
-    l50 = 0
-    for l in sorted(lengths, reverse=True):
-        sum_len += l
-        l50 += 1
-        if sum_len > rate * norm_len:
-            n50 = l
-            break
-    return l50, n50
+    lengths = np.sort(lengths)[::-1]
+    indices = np.flatnonzero(np.cumsum(lengths) > rate * norm_len)
+    if not len(indices):
+        return len(lengths), 0
+    index = int(indices[0])
+    return index + 1, lengths[index]
 
 def get_read_statistics(parsing_results,segments_by_read):
     ncol= sum([len(a[1]) for a in parsing_results]) + len(segments_by_read)
@@ -703,12 +716,13 @@ def get_read_statistics(parsing_results,segments_by_read):
     for alignments in parsing_results:
         if alignments[1].size == 0:
             continue
-        for i in range(len(alignments[1])):
-            alignment_lengths[t] = alignments[1][i][4]
-            read_lengths[t] = alignments[1][i][3]
-            aln_error[t] = alignments[1][i][7]
-            aln_mm[t] = alignments[1][i][6]
-            t+=1
+        info = alignments[1]
+        end = t + len(info)
+        alignment_lengths[t:end] = info[:, 4]
+        read_lengths[t:end] = info[:, 3]
+        aln_error[t:end] = info[:, 7]
+        aln_mm[t:end] = info[:, 6]
+        t = end
             
     for read in segments_by_read.values():
         aln_len = 0
