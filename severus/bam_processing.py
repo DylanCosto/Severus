@@ -333,7 +333,34 @@ def get_cov(bam_file, genome_id, ref_id, poslist, min_mapq, ignore_hp):
     return cov_list
 
 
-def get_coverage_parallel(bam_files, genome_ids, thread_pool, min_mapq, double_breaks, ignore_hp):
+def coverage_from_intervals(intervals, positions):
+    """Count coverage from (start, end, haplotype, secondary) rows."""
+    BUFF = 50
+    positions = np.asarray(positions, dtype=np.int64)
+    coverage = np.zeros((len(positions), 6), dtype=np.int64)
+
+    def count(starts, ends, start_side, end_side):
+        return (np.searchsorted(np.sort(starts), positions, side=start_side)
+                - np.searchsorted(np.sort(ends), positions, side=end_side))
+
+    primary = intervals[intervals[:, 3] == 0]
+    for hp in np.unique(primary[:, 2]):
+        reads = primary[primary[:, 2] == hp]
+        counts = count(reads[:, 0], reads[:, 1], 'left', 'right')
+        if np.any(counts):
+            coverage[:, hp] += counts
+
+    secondary = intervals[intervals[:, 3] != 0]
+    starts, ends = secondary[:, 0], secondary[:, 1]
+    coverage[:, 5] += count(starts, ends, 'right', 'left')
+    coverage[:, 4] += count(starts, np.minimum(starts + BUFF, ends), 'right', 'left')
+    near_end = np.maximum(starts + BUFF + 1, ends - BUFF)
+    valid = near_end <= ends
+    coverage[:, 3] += count(near_end[valid], ends[valid], 'right', 'left')
+    return coverage.tolist()
+
+
+def get_coverage_parallel(bam_files, genome_ids, thread_pool, min_mapq, double_breaks, ignore_hp, coverage_reads=None):
     db_list = defaultdict(list)
     covlist = defaultdict(list)
     for db in double_breaks:
@@ -349,7 +376,15 @@ def get_coverage_parallel(bam_files, genome_ids, thread_pool, min_mapq, double_b
         covlist = defaultdict(list)
         tasks = [(bam_files[genome_id], genome_id, ref_id, pos, min_mapq, ignore_hp) for ref_id, poslist in db_list.items() for pos in poslist]
         parsing_results = None
-        parsing_results = thread_pool.starmap(get_cov, tasks)
+        if coverage_reads is None:
+            parsing_results = thread_pool.starmap(get_cov, tasks)
+        else:
+            parsing_results = []
+            for ref_id, chunks in db_list.items():
+                positions = [pos for chunk in chunks for pos in chunk]
+                intervals = coverage_reads[genome_id].get(ref_id, np.empty((0, 4), dtype=np.int64))
+                counts = coverage_from_intervals(intervals, positions)
+                parsing_results.append({(ref_id, pos): count for pos, count in zip(positions, counts)})
         for item in parsing_results:
             for key, value in item.items():
                 covlist[key] = value
@@ -358,7 +393,7 @@ def get_coverage_parallel(bam_files, genome_ids, thread_pool, min_mapq, double_b
             db.bp_2.spanning_reads[genome_id] = covlist[(db.bp_2.ref_id, db.bp_2.position)]
     
         
-def get_all_reads(bam_file, region, genome_id,sv_size,use_supplementary_tag, ignore_hp):
+def get_all_reads(bam_file, region, genome_id,sv_size,use_supplementary_tag, ignore_hp, min_mapq=None):
     """
     Yields set of split reads for each contig separately. Only reads primary alignments
     and infers the split reads from SA alignment tag
@@ -370,8 +405,13 @@ def get_all_reads(bam_file, region, genome_id,sv_size,use_supplementary_tag, ign
     read_info = np.zeros((ncol,9), dtype = int)
     ref_ind, ref_id, region_start, region_end = region
     aln_file = pysam.AlignmentFile(bam_file, "rb")
+    coverage_reads = []
     t=0
     for aln in aln_file.fetch(ref_id, region_start, region_end,  multiple_iterators=True):
+        if min_mapq is not None and not aln.is_unmapped and aln.reference_start >= region_start:
+            if aln.is_secondary or aln.mapping_quality > min_mapq:
+                hp = int(aln.get_tag('HP')) if not ignore_hp and not aln.is_secondary and aln.has_tag('HP') else 0
+                coverage_reads.append((aln.reference_start, aln.reference_end, hp, aln.is_secondary))
         if not aln.is_secondary and not aln.is_unmapped:
             new_segment, read_inf = get_segment(aln, genome_id, sv_size, use_supplementary_tag, ref_ind, ignore_hp)
             if new_segment:
@@ -393,11 +433,13 @@ def get_all_reads(bam_file, region, genome_id,sv_size,use_supplementary_tag, ign
         read_info_final = read_info[0:t-1]
     else:
         read_info_final = np.concatenate((read_info_final, read_info[0:t-1]), axis=0)                
+    if min_mapq is not None:
+        return alignments, read_info_final, np.asarray(coverage_reads, dtype=np.int64).reshape(-1, 4)
     return (alignments, read_info_final)
 
 
 def get_all_reads_parallel(bam_file, thread_pool, ref_lengths, genome_id,
-                           coverage_histograms, mismatch_histograms, n90ls, bg_mmls,read_qual,read_qual_len, args):
+                           coverage_histograms, mismatch_histograms, n90ls, bg_mmls,read_qual,read_qual_len, args, coverage_reads=None):
 
     CHUNK_SIZE = 10000000
     sv_size = args.sv_size
@@ -414,9 +456,16 @@ def get_all_reads_parallel(bam_file, thread_pool, ref_lengths, genome_id,
             if ctg_len - reg_end < CHUNK_SIZE:
                 reg_end = ctg_len
             fetch_list.append((j, ctg, reg_start, reg_end))
-    tasks = [(bam_file, region, genome_id, sv_size, use_supplementary_tag, ignore_hp) for region in fetch_list]
+    min_mapq = args.min_mapping_quality if coverage_reads is not None else None
+    tasks = [(bam_file, region, genome_id, sv_size, use_supplementary_tag, ignore_hp, min_mapq) for region in fetch_list]
     parsing_results = None
     parsing_results = thread_pool.starmap(get_all_reads, tasks, chunksize=1)
+    if coverage_reads is not None:
+        by_reference = defaultdict(list)
+        for region, result in zip(fetch_list, parsing_results):
+            if len(result[2]):
+                by_reference[region[1]].append(result[2])
+        coverage_reads[genome_id] = {ref: np.concatenate(chunks) for ref, chunks in by_reference.items()}
     segments_by_read = defaultdict(list)
     for alignments in parsing_results:
         for aln in alignments[0]:
